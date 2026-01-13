@@ -26,6 +26,7 @@ export type TaskOptions = {
   isAppBundle: boolean
   debuggable: boolean
   skipDecode: boolean
+  skipEncode?: boolean
 }
 
 interface PatchingError extends Error {
@@ -36,12 +37,17 @@ interface PatchingError extends Error {
   all?: string
 }
 
-const { version } = require('../package.json')
-
-async function main() {
+export default async function cli() {
   const args = parseArgs(process.argv.slice(2), {
     string: ['apktool', 'certificate', 'tmp-dir', 'maps-api-key'],
-    boolean: ['help', 'skip-patches', 'wait', 'debuggable', 'keep-tmp-dir'],
+    boolean: [
+      'help',
+      'skip-patches',
+      'wait',
+      'debuggable',
+      'keep-tmp-dir',
+      'skip-encode',
+    ],
   })
 
   if (args.help) {
@@ -67,8 +73,9 @@ async function main() {
     certificatePath = path.resolve(args.certificate)
     let certificateExtension = path.extname(certificatePath)
 
-    if (certificateExtension !== '.pem' && certificateExtension !== '.der')
+    if (certificateExtension !== '.pem' && certificateExtension !== '.der') {
       showSupportedCertificateExtensions()
+    }
   }
 
   let tmpDir = args['tmp-dir']
@@ -104,6 +111,7 @@ async function main() {
     isAppBundle,
     debuggable: args.debuggable,
     skipDecode,
+    skipEncode: args['skip-encode'],
   })
     .run()
     .then(async context => {
@@ -111,11 +119,20 @@ async function main() {
         showAppBundleWarning()
       }
 
-      console.log(
-        chalk`\n  {green.inverse  Done! } Patched file: {bold ./${outputName}}\n`,
-      )
+      // If we skipped encoding we should give the user the path to the patched decode dir
+      if (args['skip-encode']) {
+        const patchedDir = skipDecode ? inputPath : path.join(tmpDir, 'decode')
+        console.log(
+          chalk`\n  {green.inverse  Done! } Patched (decoded) files are in: {bold ${patchedDir}}\n`,
+        )
+      } else {
+        console.log(
+          chalk`\n  {green.inverse  Done! } Patched file: {bold ./${outputName}}\n`,
+        )
+      }
 
-      if (!args['keep-tmp-dir']) {
+      // Don't delete tmp dir if user asked to keep it OR if they used skip-encode
+      if (!args['keep-tmp-dir'] && !args['skip-encode']) {
         try {
           await fs.rm(tmpDir, { recursive: true, force: true })
         } catch (error: any) {
@@ -129,31 +146,53 @@ async function main() {
         }
       }
     })
-    .catch((error: PatchingError) => {
-      const message = getErrorMessage(error, { tmpDir })
+}
 
-      console.error(
-        [
-          '',
-          chalk`  {red.inverse.bold  Failed! } An error occurred:`,
-          '',
-          message,
-          '',
-          `  The full logs of all commands are available here:`,
-          `  ${path.join(tmpDir, 'logs')}`,
-          '',
-        ].join('\n'),
-      )
-      if (process.arch.startsWith('arm')) showArmWarning()
+function showHelp() {
+  console.log(chalk`
+  $ {bold apk-mitm} <path-to-apk/xapk/apks/decoded-directory>
 
-      process.exit(1)
-    })
+  {blue {dim.bold *} Optional flags:}
+  {dim {bold --wait} Wait for manual changes before re-encoding}
+  {dim {bold --tmp-dir <path>} Where temporary files will be stored}
+  {dim {bold --keep-tmp-dir} Don't delete the temporary directory after patching}
+  {dim {bold --debuggable} Make the patched app debuggable}
+  {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
+  {dim {bold --apktool <path-to-jar>} Use custom version of Apktool}
+  {dim {bold --certificate <path-to-pem/der>} Add specific certificate to network security config}
+  {dim {bold --maps-api-key <api-key>} Add custom Google Maps API key to be replaced while patching apk}
+  {dim {bold --skip-encode} Skip the encoding and signing steps and keep the patched decode directory}
+  `)
 }
 
 /**
- * Determines the correct "task" (e.g. "patch APK" or "patch XAPK") depending on
- * the input path's type (file or directory) and extension (e.g. ".apk").
+ * Error that is shown when the file provided through the positional argument
+ * has an unsupported extension. Exits with status 1 after showing the message.
  */
+function showSupportedExtensions(): never {
+  console.log(chalk`{yellow
+  It looks like you tried running {bold apk-mitm} with an unsupported file type!
+
+  Only the following file extensions are supported: {bold .apk}, {bold .xapk}, and {bold .apks} (or {bold .zip})
+  }`)
+
+  process.exit(1)
+}
+
+/**
+ * Error that is shown when the file provided through the `--certificate` flag
+ * has an unsupported extension. Exits with status 1 after showing the message.
+ */
+function showSupportedCertificateExtensions(): never {
+  console.log(chalk`{yellow
+  It looks like the certificate file you provided is unsupported!
+
+  Only {bold .pem} and {bold .der} certificate files are supported.
+  }`)
+
+  process.exit(1)
+}
+
 async function determineTask(inputPath: string) {
   const fileStats = await fs.stat(inputPath)
 
@@ -203,78 +242,7 @@ async function determineTask(inputPath: string) {
   return { skipDecode, taskFunction, isAppBundle, outputName }
 }
 
-function getErrorMessage(error: PatchingError, { tmpDir }: { tmpDir: string }) {
-  // User errors can be shown without a stack trace
-  if (error instanceof UserError) return error.message
-
-  // Errors from commands can also be shown without a stack trace
-  if (error.all) return formatCommandError(error.all, { tmpDir })
-
-  return error.stack
-}
-
-function formatCommandError(error: string, { tmpDir }: { tmpDir: string }) {
-  return (
-    error
-      // Replace mentions of the (sometimes very long) temporary directory path
-      .replace(new RegExp(tmpDir, 'g'), chalk`{bold <tmp_dir>}`)
-      // Highlight (usually relevant) warning lines in Apktool output
-      .replace(/^W: .+$/gm, line => chalk`{yellow ${line}}`)
-      // De-emphasize Apktool info lines
-      .replace(/^I: .+$/gm, line => chalk`{dim ${line}}`)
-      // De-emphasize (not very helpful) Apktool "could not exec" error message
-      .replace(
-        /^.+brut\.common\.BrutException: could not exec.+$/gm,
-        line => chalk`{dim ${line}}`,
-      )
-  )
-}
-
-function showHelp() {
-  console.log(chalk`
-  $ {bold apk-mitm} <path-to-apk/xapk/apks/decoded-directory>
-
-  {blue {dim.bold *} Optional flags:}
-  {dim {bold --wait} Wait for manual changes before re-encoding}
-  {dim {bold --tmp-dir <path>} Where temporary files will be stored}
-  {dim {bold --keep-tmp-dir} Don't delete the temporary directory after patching}
-  {dim {bold --debuggable} Make the patched app debuggable}
-  {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
-  {dim {bold --apktool <path-to-jar>} Use custom version of Apktool}
-  {dim {bold --certificate <path-to-pem/der>} Add specific certificate to network security config}
-  {dim {bold --maps-api-key <api-key>} Add custom Google Maps API key to be replaced while patching apk}
-  `)
-}
-
-/**
- * Error that is shown when the file provided through the positional argument
- * has an unsupported extension. Exits with status 1 after showing the message.
- */
-function showSupportedExtensions(): never {
-  console.log(chalk`{yellow
-  It looks like you tried running {bold apk-mitm} with an unsupported file type!
-
-  Only the following file extensions are supported: {bold .apk}, {bold .xapk}, and {bold .apks} (or {bold .zip})
-  }`)
-
-  process.exit(1)
-}
-
-/**
- * Error that is shown when the file provided through the `--certificate` flag
- * has an unsupported extension. Exits with status 1 after showing the message.
- */
-function showSupportedCertificateExtensions(): never {
-  console.log(chalk`{yellow
-  It looks like the certificate file you provided is unsupported!
-
-  Only {bold .pem} and {bold .der} certificate files are supported.
-  }`)
-
-  process.exit(1)
-}
-
-function showVersions({
+export function showVersions({
   apktool,
   uberApkSigner,
 }: {
@@ -298,5 +266,3 @@ export function showArmWarning() {
   before reporting an issue.
   }`)
 }
-
-main()
