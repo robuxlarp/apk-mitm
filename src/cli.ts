@@ -3,7 +3,7 @@ import * as fs from './utils/fs'
 import parseArgs = require('yargs-parser')
 import chalk = require('chalk')
 import Listr = require('listr')
-import tempy = require('tempy')
+// tempy removed (no longer used)
 
 import patchApk, { showAppBundleWarning } from './patch-apk'
 import { patchXapkBundle, patchApksBundle } from './patch-app-bundle'
@@ -12,6 +12,10 @@ import Apktool from './tools/apktool'
 import UberApkSigner from './tools/uber-apk-signer'
 import Tool from './tools/tool'
 import UserError from './utils/user-error'
+
+// Import package.json to read the package version at runtime
+// Note: tsconfig.json must have "resolveJsonModule": true and "esModuleInterop": true
+import pkg from '../package.json'
 
 export type TaskOptions = {
   inputPath: string
@@ -27,14 +31,6 @@ export type TaskOptions = {
   debuggable: boolean
   skipDecode: boolean
   skipEncode?: boolean
-}
-
-interface PatchingError extends Error {
-  /**
-   * Interleaved stdout and stderr output on execa errors
-   * @see https://github.com/sindresorhus/execa#all-1
-   */
-  all?: string
 }
 
 export default async function cli() {
@@ -79,7 +75,7 @@ export default async function cli() {
   }
 
   // Compute a sensible default "working" directory for decode/output if the user
-  // didn't provide an explicit temp dir or out-dir. This puts the files where
+  // didn't provide an explicit tmp-dir or out-dir. This puts the files where
   // you're running the command (current working directory) instead of a random
   // temp path.
   const baseName = path.basename(inputPath, path.extname(inputPath))
@@ -91,10 +87,6 @@ export default async function cli() {
     tmpDir = path.resolve(args['tmp-dir'])
   } else {
     // Default to a directory in the current working directory.
-    // If we're decoding into a directory provided by the user (skipDecode),
-    // still create a workspace dir next to the current working directory to
-    // store framework/tmp apk. If not skipping decode, use a decode-specific
-    // folder next to where the user runs the command.
     tmpDir = skipDecode
       ? path.join(process.cwd(), `${baseName}-apk-mitm`)
       : path.join(process.cwd(), `${baseName}-decode`)
@@ -103,6 +95,190 @@ export default async function cli() {
   await fs.mkdir(tmpDir, { recursive: true })
 
   const apktool = new Apktool({
+    frameworkPath: path.join(tmpDir, 'framework'),
+    customPath: args.apktool ? path.resolve(args.apktool) : undefined,
+  })
+  const uberApkSigner = new UberApkSigner()
+
+  showVersions({ apktool, uberApkSigner })
+  if (skipDecode) {
+    console.log(
+      chalk.dim(`  Patching from decoded apktool directory:\n  ${inputPath}\n`),
+    )
+  } else {
+    console.log(chalk.dim(`  Using working directory:\n  ${tmpDir}\n`))
+  }
+
+  taskFunction({
+    inputPath,
+    outputPath,
+    certificatePath,
+    mapsApiKey,
+    tmpDir,
+    apktool,
+    uberApkSigner,
+    wait: args.wait,
+    skipPatches: args.skipPatches,
+    isAppBundle,
+    debuggable: args.debuggable,
+    skipDecode,
+    skipEncode: args['skip-encode'],
+  })
+    .run()
+    .then(async context => {
+      if (taskFunction === patchApk && context.usesAppBundle) {
+        showAppBundleWarning()
+      }
+
+      // If we skipped encoding we should give the user the path to the patched decode dir
+      if (args['skip-encode']) {
+        const patchedDir = skipDecode ? inputPath : path.join(tmpDir, 'decode')
+        console.log(
+          chalk`\n  {green.inverse  Done! } Patched (decoded) files are in: {bold ${patchedDir}}\n`,
+        )
+      } else {
+        console.log(
+          chalk`\n  {green.inverse  Done! } Patched file: {bold ./${outputName}}\n`,
+        )
+      }
+
+      // Don't delete tmp dir if user asked to keep it OR if they used skip-encode
+      // OR if they explicitly provided an out-dir.
+      if (!args['keep-tmp-dir'] && !args['skip-encode'] && !args['out-dir']) {
+        try {
+          await fs.rm(tmpDir, { recursive: true, force: true })
+        } catch (error: any) {
+          // No idea why Windows gives us an `EBUSY: resource busy or locked`
+          // error here, but deleting the temporary directory isn't the most
+          // important thing in the world, so let's just ignore it
+          const ignoreError =
+            process.platform === 'win32' && error.code === 'EBUSY'
+
+          if (!ignoreError) throw error
+        }
+      }
+    })
+}
+
+function showHelp() {
+  console.log(chalk`
+  $ {bold apk-mitm} <path-to-apk/xapk/apks/decoded-directory>
+
+  {blue {dim.bold *} Optional flags:}
+  {dim {bold --wait} Wait for manual changes before re-encoding}
+  {dim {bold --tmp-dir <path>} Where temporary files will be stored}
+  {dim {bold --out-dir <path>} Where decoded/working files should go (defaults to current working directory)}
+  {dim {bold --keep-tmp-dir} Don't delete the temporary directory after patching}
+  {dim {bold --debuggable} Make the patched app debuggable}
+  {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
+  {dim {bold --apktool <path-to-jar>} Use custom version of Apktool}
+  {dim {bold --certificate <path-to-pem/der>} Add specific certificate to network security config}
+  {dim {bold --maps-api-key <api-key>} Add custom Google Maps API key to be replaced while patching apk}
+  {dim {bold --skip-encode} Skip the encoding and signing steps and keep the patched decode directory}
+  `)
+}
+
+/**
+ * Error that is shown when the file provided through the positional argument
+ * has an unsupported extension. Exits with status 1 after showing the message.
+ */
+function showSupportedExtensions(): never {
+  console.log(chalk`{yellow
+  It looks like you tried running {bold apk-mitm} with an unsupported file type!
+
+  Only the following file extensions are supported: {bold .apk}, {bold .xapk}, and {bold .apks} (or {bold .zip})
+  }`)
+
+  process.exit(1)
+}
+
+/**
+ * Error that is shown when the file provided through the `--certificate` flag
+ * has an unsupported extension. Exits with status 1 after showing the message.
+ */
+function showSupportedCertificateExtensions(): never {
+  console.log(chalk`{yellow
+  It looks like the certificate file you provided is unsupported!
+
+  Only {bold .pem} and {bold .der} certificate files are supported.
+  }`)
+
+  process.exit(1)
+}
+
+async function determineTask(inputPath: string) {
+  const fileStats = await fs.stat(inputPath)
+
+  let outputFileExtension = '.apk'
+
+  let skipDecode = false
+  let isAppBundle = false
+  let taskFunction: (options: TaskOptions) => Listr
+
+  if (fileStats.isDirectory()) {
+    taskFunction = patchApk
+    skipDecode = true
+
+    const apktoolYamlPath = path.join(inputPath, 'apktool.yml')
+    if (!(await fs.exists(apktoolYamlPath))) {
+      throw new UserError(
+        'No "apktool.yml" file found inside the input directory!' +
+          ' Make sure to specify a directory created by "apktool decode".',
+      )
+    }
+  } else {
+    const inputFileExtension = path.extname(inputPath)
+
+    switch (inputFileExtension) {
+      case '.apk':
+        taskFunction = patchApk
+        break
+      case '.xapk':
+        isAppBundle = true
+        taskFunction = patchXapkBundle
+        break
+      case '.apks':
+      case '.zip':
+        isAppBundle = true
+        taskFunction = patchApksBundle
+        break
+      default:
+        showSupportedExtensions()
+    }
+
+    outputFileExtension = inputFileExtension
+  }
+
+  const baseName = path.basename(inputPath, outputFileExtension)
+  const outputName = `${baseName}-patched${outputFileExtension}`
+
+  return { skipDecode, taskFunction, isAppBundle, outputName }
+}
+
+export function showVersions({
+  apktool,
+  uberApkSigner,
+}: {
+  apktool: Tool
+  uberApkSigner: Tool
+}) {
+  console.log(chalk`
+  {dim ╭} {blue {bold apk-mitm} v${pkg.version}}
+  {dim ├ {bold apktool} ${apktool.version.name}
+  ╰ {bold uber-apk-signer} ${uberApkSigner.version.name}}
+  `)
+}
+
+export function showArmWarning() {
+  console.log(chalk`{yellow
+  {inverse.bold  NOTE }
+
+  {bold apk-mitm} doesn't officially support ARM-based devices (like Raspberry Pi's)
+  at the moment, so the error above might be a result of that. Please try
+  patching this APK on a device with a more common CPU architecture like x64
+  before reporting an issue.
+  }`)
+}  const apktool = new Apktool({
     frameworkPath: path.join(tmpDir, 'framework'),
     customPath: args.apktool ? path.resolve(args.apktool) : undefined,
   })
