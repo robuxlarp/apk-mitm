@@ -56,6 +56,8 @@ export default function patchApk(options: TaskOptions) {
     },
     {
       title: 'Encoding patched APK file',
+      // Skip the encoding step entirely if the caller requested skipEncode
+      skip: () => (options.skipEncode ? '--skip-encode flag specified.' : false),
       task: () =>
         new Listr([
           {
@@ -81,6 +83,8 @@ export default function patchApk(options: TaskOptions) {
     },
     {
       title: 'Signing patched APK file',
+      // Signing should also be skipped if encoding was skipped
+      skip: () => (options.skipEncode ? '--skip-encode flag specified.' : false),
       task: () =>
         observeAsync(async log => {
           await uberApkSigner
