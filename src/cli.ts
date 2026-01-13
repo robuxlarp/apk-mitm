@@ -39,7 +39,7 @@ interface PatchingError extends Error {
 
 export default async function cli() {
   const args = parseArgs(process.argv.slice(2), {
-    string: ['apktool', 'certificate', 'tmp-dir', 'maps-api-key'],
+    string: ['apktool', 'certificate', 'tmp-dir', 'maps-api-key', 'out-dir'],
     boolean: [
       'help',
       'skip-patches',
@@ -78,9 +78,28 @@ export default async function cli() {
     }
   }
 
-  let tmpDir = args['tmp-dir']
-    ? path.resolve(args['tmp-dir'])
-    : tempy.directory({ prefix: 'apk-mitm-' })
+  // Compute a sensible default "working" directory for decode/output if the user
+  // didn't provide an explicit temp dir or out-dir. This puts the files where
+  // you're running the command (current working directory) instead of a random
+  // temp path.
+  const baseName = path.basename(inputPath, path.extname(inputPath))
+
+  let tmpDir: string
+  if (args['out-dir']) {
+    tmpDir = path.resolve(args['out-dir'])
+  } else if (args['tmp-dir']) {
+    tmpDir = path.resolve(args['tmp-dir'])
+  } else {
+    // Default to a directory in the current working directory.
+    // If we're decoding into a directory provided by the user (skipDecode),
+    // still create a workspace dir next to the current working directory to
+    // store framework/tmp apk. If not skipping decode, use a decode-specific
+    // folder next to where the user runs the command.
+    tmpDir = skipDecode
+      ? path.join(process.cwd(), `${baseName}-apk-mitm`)
+      : path.join(process.cwd(), `${baseName}-decode`)
+  }
+
   await fs.mkdir(tmpDir, { recursive: true })
 
   const apktool = new Apktool({
@@ -95,7 +114,7 @@ export default async function cli() {
       chalk.dim(`  Patching from decoded apktool directory:\n  ${inputPath}\n`),
     )
   } else {
-    console.log(chalk.dim(`  Using temporary directory:\n  ${tmpDir}\n`))
+    console.log(chalk.dim(`  Using working directory:\n  ${tmpDir}\n`))
   }
 
   taskFunction({
@@ -132,7 +151,8 @@ export default async function cli() {
       }
 
       // Don't delete tmp dir if user asked to keep it OR if they used skip-encode
-      if (!args['keep-tmp-dir'] && !args['skip-encode']) {
+      // OR if they explicitly provided an out-dir.
+      if (!args['keep-tmp-dir'] && !args['skip-encode'] && !args['out-dir']) {
         try {
           await fs.rm(tmpDir, { recursive: true, force: true })
         } catch (error: any) {
@@ -155,6 +175,7 @@ function showHelp() {
   {blue {dim.bold *} Optional flags:}
   {dim {bold --wait} Wait for manual changes before re-encoding}
   {dim {bold --tmp-dir <path>} Where temporary files will be stored}
+  {dim {bold --out-dir <path>} Where decoded/working files should go (defaults to current working directory)}
   {dim {bold --keep-tmp-dir} Don't delete the temporary directory after patching}
   {dim {bold --debuggable} Make the patched app debuggable}
   {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
